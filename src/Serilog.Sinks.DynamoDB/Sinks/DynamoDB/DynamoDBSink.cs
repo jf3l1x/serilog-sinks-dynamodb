@@ -15,53 +15,110 @@
 
 using System;
 using System.Collections.Generic;
+using System.Data.SqlClient;
+using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
+using Amazon;
 using Amazon.DynamoDBv2;
 using Amazon.DynamoDBv2.DataModel;
+using Amazon.Runtime;
 using Serilog.Debugging;
 using Serilog.Events;
 using Serilog.Sinks.PeriodicBatching;
 
 namespace Serilog.Sinks.DynamoDB
 {
-  public class DynamoDBSink : PeriodicBatchingSink
-  {
-    private readonly IFormatProvider _formatProvider;
-    private readonly string _tableName;
-
-    public DynamoDBSink(IFormatProvider formatProvider, string tableName) :base(1000, TimeSpan.FromSeconds(15))
+    public class DynamoDBSink : PeriodicBatchingSink
     {
-      _formatProvider = formatProvider;
-      _tableName = tableName;
-      AmazonDynamoDbConfig = new AmazonDynamoDBConfig();
-      OperationConfig = new DynamoDBOperationConfig {OverrideTableName = tableName};
-    }
-
-    private DynamoDBOperationConfig OperationConfig { get; set; }
-
-    private AmazonDynamoDBConfig AmazonDynamoDbConfig { get; set; }
-
-    protected override async Task EmitBatchAsync(IEnumerable<LogEvent> events)
-    {
-      var records = events.Select(x => new LogDocument(x, x.RenderMessage(_formatProvider)));
-
-      try
-      {
-        using (var client = new AmazonDynamoDBClient(AmazonDynamoDbConfig))
+        private readonly IFormatProvider _formatProvider;
+        private readonly DynamoDBSinkOptions _options;
+        private readonly string _tableName;
+        private readonly DefaultJsonFormatter _formatter;
+        private RegionEndpoint _regionEndpoint;
+        private AWSCredentials _credentials;
+        public DynamoDBSink(IFormatProvider formatProvider, DynamoDBSinkOptions options)
+            : base(options.BatchPostingLimit, options.Period)
         {
-          using (var context = new DynamoDBContext(client))
-          {
-            var batchWrite = context.CreateBatchWrite<LogDocument>(OperationConfig);
-            batchWrite.AddPutItems(records);
-            await batchWrite.ExecuteAsync();
-          }
+            _formatter=new DynamoDBJsonFormatter();
+            _formatProvider = formatProvider;
+            _options = options;
+            _tableName = options.TableName;
+            
+            if (!string.IsNullOrEmpty(_options.AccessKey))
+            {
+                _credentials=new BasicAWSCredentials(_options.AccessKey,_options.SecretKey);
+            }
+            if (!string.IsNullOrEmpty(_options.Region))
+            {
+                if (_credentials == null)
+                {
+                    AWSConfigs.AWSRegion = _options.Region;
+                }
+                else
+                {
+                    _regionEndpoint = RegionEndpoint.GetBySystemName(_options.Region);
+                }
+                
+            }
+            AmazonDynamoDbConfig = new AmazonDynamoDBConfig() ;
+            
+            OperationConfig = new DynamoDBOperationConfig {OverrideTableName = options.TableName};
         }
-      }
-      catch (Exception exception)
-      {
-        SelfLog.WriteLine("Unable to write events to DynamoDB Sink for {0}: {1}", _tableName, exception);
-      }
+
+        private DynamoDBOperationConfig OperationConfig { get; }
+
+        private AmazonDynamoDBConfig AmazonDynamoDbConfig { get; }
+
+        protected override async Task EmitBatchAsync(IEnumerable<LogEvent> events)
+        {
+            var records = events.Select(x =>
+            {
+                var document = new LogDocument(x, x.RenderMessage(_formatProvider));
+                var sw = new StringWriter();
+                _formatter.Format(x, sw);
+                document.Properties = sw.ToString();
+                return document;
+            });
+            AmazonDynamoDBClient client = null;
+            try
+            {
+                
+                if (_credentials != null)
+                {
+                    if (_regionEndpoint != null)
+                    {
+                        client = new AmazonDynamoDBClient(_credentials, _regionEndpoint);
+                    }
+                    else
+                    {
+                        client = new AmazonDynamoDBClient(_credentials, AmazonDynamoDbConfig);
+                    }
+
+                }
+                else
+                {
+                    client = new AmazonDynamoDBClient( AmazonDynamoDbConfig);
+                }
+                using (var context = new DynamoDBContext(client))
+                {
+                    var batchWrite = context.CreateBatchWrite<LogDocument>(OperationConfig);
+                    batchWrite.AddPutItems(records);
+                    await batchWrite.ExecuteAsync();
+                }
+
+            }
+            catch (Exception exception)
+            {
+                SelfLog.WriteLine("Unable to write events to DynamoDB Sink for {0}: {1}", _tableName, exception);
+            }
+            finally
+            {
+                if (client != null)
+                {
+                    client.Dispose();
+                }
+            }
+        }
     }
-  }
 }
